@@ -5,6 +5,7 @@ from config import conf
 class Session(object):
     def __init__(self, session_id, system_prompt=None):
         self.session_id = session_id
+        self.messages = []
         if system_prompt is None:
             self.system_prompt = conf().get("character_desc", "")
         else:
@@ -12,17 +13,20 @@ class Session(object):
 
     # 重置会话
     def reset(self):
-        raise NotImplementedError
+        system_item = {'role': 'system', 'content': self.system_prompt}
+        self.messages = [system_item]
 
     def set_system_prompt(self, system_prompt):
         self.system_prompt = system_prompt
         self.reset()
 
     def add_query(self, query):
-        raise NotImplementedError
+        user_item = {'role': 'user', 'content': query}
+        self.messages.append(user_item)
 
     def add_reply(self, reply):
-        raise NotImplementedError
+        assistant_item = {'role': 'assistant', 'content': reply}
+        self.messages.append(assistant_item)
     
     def discard_exceeding(self, max_tokens=None, cur_tokens=None):
         raise NotImplementedError
@@ -46,7 +50,7 @@ class SessionManager(object):
         '''
         if session_id not in self.sessions:
             self.sessions[session_id] = self.sessioncls(session_id, system_prompt, **self.session_args)
-        elif system_prompt is not None: # 如果有新的system_prompt，更新并重置session
+        elif system_prompt is not None:  # 如果有新的system_prompt，更新并重置session
             self.sessions[session_id].set_system_prompt(system_prompt)
         session = self.sessions[session_id]
         return session
