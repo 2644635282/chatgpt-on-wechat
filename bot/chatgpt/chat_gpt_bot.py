@@ -11,12 +11,14 @@ from common.log import logger
 from common.token_bucket import TokenBucket
 from common.expired_dict import ExpiredDict
 import openai
+import openai.error
 import time
 
 # OpenAI对话模型API (可用)
 class ChatGPTBot(Bot,OpenAIImage):
     def __init__(self):
         super().__init__()
+        # set the default api_key
         openai.api_key = conf().get('open_ai_api_key')
         if conf().get('open_ai_api_base'):
             openai.api_base = conf().get('open_ai_api_base')
@@ -31,7 +33,8 @@ class ChatGPTBot(Bot,OpenAIImage):
     def reply(self, query, context=None):
         # acquire reply content
         if context.type == ContextType.TEXT:
-            logger.info("[OPEN_AI] query={}".format(query))
+            logger.info("[CHATGPT] query={}".format(query))
+
 
             session_id = context['session_id']
             reply = None
@@ -48,14 +51,16 @@ class ChatGPTBot(Bot,OpenAIImage):
             if reply:
                 return reply
             session = self.sessions.session_query(query, session_id)
-            logger.debug("[OPEN_AI] session query={}".format(session.messages))
+            logger.debug("[CHATGPT] session query={}".format(session.messages))
+
+            api_key = context.get('openai_api_key')
 
             # if context.get('stream'):
             #     # reply in stream
             #     return self.reply_text_stream(query, new_query, session_id)
 
-            reply_content = self.reply_text(session, session_id, 0)
-            logger.debug("[OPEN_AI] new_query={}, session_id={}, reply_cont={}, completion_tokens={}".format(session.messages, session_id, reply_content["content"], reply_content["completion_tokens"]))
+            reply_content = self.reply_text(session, session_id, api_key, 0)
+            logger.debug("[CHATGPT] new_query={}, session_id={}, reply_cont={}, completion_tokens={}".format(session.messages, session_id, reply_content["content"], reply_content["completion_tokens"]))
             if reply_content['completion_tokens'] == 0 and len(reply_content['content']) > 0:
                 reply = Reply(ReplyType.ERROR, reply_content['content'])
             elif reply_content["completion_tokens"] > 0:
@@ -63,7 +68,7 @@ class ChatGPTBot(Bot,OpenAIImage):
                 reply = Reply(ReplyType.TEXT, reply_content["content"])
             else:
                 reply = Reply(ReplyType.ERROR, reply_content['content'])
-                logger.debug("[OPEN_AI] reply {} used 0 tokens.".format(reply_content))
+                logger.debug("[CHATGPT] reply {} used 0 tokens.".format(reply_content))
             return reply
 
         elif context.type == ContextType.IMAGE_CREATE:
@@ -86,9 +91,10 @@ class ChatGPTBot(Bot,OpenAIImage):
             "top_p":1,
             "frequency_penalty":conf().get('frequency_penalty', 0.0),  # [-2,2]之间，该值越大则更倾向于产生不同的内容
             "presence_penalty":conf().get('presence_penalty', 0.0),  # [-2,2]之间，该值越大则更倾向于产生不同的内容
+            "request_timeout": conf().get('request_timeout', 30),  # 请求超时时间
         }
 
-    def reply_text(self, session:ChatGPTSession, session_id, retry_count=0) -> dict:
+    def reply_text(self, session:ChatGPTSession, session_id, api_key, retry_count=0) -> dict:
         '''
         call openai's ChatCompletion to get the answer
         :param session: a conversation session
@@ -98,37 +104,42 @@ class ChatGPTBot(Bot,OpenAIImage):
         '''
         try:
             if conf().get('rate_limit_chatgpt') and not self.tb4chatgpt.get_token():
-                return {"completion_tokens": 0, "content": "提问太快啦，请休息一下再问我吧"}
+                raise openai.error.RateLimitError("RateLimitError: rate limit exceeded")
+            # if api_key == None, the default openai.api_key will be used
             response = openai.ChatCompletion.create(
-                messages=session.messages, **self.compose_args()
+                api_key=api_key, messages=session.messages, **self.compose_args()
             )
             # logger.info("[ChatGPT] reply={}, total_tokens={}".format(response.choices[0]['message']['content'], response["usage"]["total_tokens"]))
             return {"total_tokens": response["usage"]["total_tokens"],
                     "completion_tokens": response["usage"]["completion_tokens"],
                     "content": response.choices[0]['message']['content']}
-        except openai.error.RateLimitError as e:
-            # rate limit exception
-            logger.warn(e)
-            if retry_count < 1:
-                time.sleep(5)
-                logger.warn("[OPEN_AI] RateLimit exceed, 第{}次重试".format(retry_count+1))
-                return self.reply_text(session, session_id, retry_count+1)
-            else:
-                return {"completion_tokens": 0, "content": "提问太快啦，请休息一下再问我吧"}
-        except openai.error.APIConnectionError as e:
-            # api connection exception
-            logger.warn(e)
-            logger.warn("[OPEN_AI] APIConnection failed")
-            return {"completion_tokens": 0, "content": "我连接不到你的网络"}
-        except openai.error.Timeout as e:
-            logger.warn(e)
-            logger.warn("[OPEN_AI] Timeout")
-            return {"completion_tokens": 0, "content": "我没有收到你的消息"}
         except Exception as e:
-            # unknown exception
-            logger.exception(e)
-            self.sessions.clear_session(session_id)
-            return {"completion_tokens": 0, "content": "请再问我一次吧"}
+            need_retry = retry_count < 2
+            result = {"completion_tokens": 0, "content": "我现在有点累了，等会再来吧"}
+            if isinstance(e, openai.error.RateLimitError):
+                logger.warn("[CHATGPT] RateLimitError: {}".format(e))
+                result['content'] = "提问太快啦，请休息一下再问我吧"
+                if need_retry:
+                    time.sleep(5)
+            elif isinstance(e, openai.error.Timeout):
+                logger.warn("[CHATGPT] Timeout: {}".format(e))
+                result['content'] = "我没有收到你的消息"
+                if need_retry:
+                    time.sleep(5)
+            elif isinstance(e, openai.error.APIConnectionError):
+                logger.warn("[CHATGPT] APIConnectionError: {}".format(e))
+                need_retry = False
+                result['content'] = "我连接不到你的网络"
+            else:
+                logger.warn("[CHATGPT] Exception: {}".format(e))
+                need_retry = False
+                self.sessions.clear_session(session_id)
+
+            if need_retry:
+                logger.warn("[CHATGPT] 第{}次重试".format(retry_count+1))
+                return self.reply_text(session, session_id, api_key, retry_count+1)
+            else:
+                return result
 
 
 class AzureChatGPTBot(ChatGPTBot):
